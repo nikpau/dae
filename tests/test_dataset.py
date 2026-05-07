@@ -1,5 +1,14 @@
 """
-Tests for :class:`LibriSpeechDataset` and :class:`DEMANDNoiseDataset`.
+Tests for :class:`LibriSpeechDataset`, :class:`DEMANDNoiseDataset`,
+:class:`DEMANDNoiseType`, and :func:`add_noise_snr`.
+
+The data module is split across three files:
+
+- :mod:`dae.data.err`   — :class:`~dae.data.err.EntryPointError`
+- :mod:`dae.data.noise` — :class:`~dae.data.noise.DEMANDNoiseType`,
+  :class:`~dae.data.noise.DEMANDNoiseDataset`,
+  :func:`~dae.data.noise.add_noise_snr`
+- :mod:`dae.data.speech` — :class:`~dae.data.speech.LibriSpeechDataset`
 
 A micro-subset of real LibriSpeech FLAC files (speaker 1867, chapter 154075)
 is used so tests run without downloading additional data.  Each ``tmp_path``
@@ -16,10 +25,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dae.data.dataprep import (
-    EntryPointError,
-    LibriSpeechDataset,
-)
+from aese.data.err import EntryPointError
+from aese.data.noise import DEMANDNoiseDataset, DEMANDNoiseType, add_noise_snr
+from aese.data.librispeech import LibriSpeechDataset
 
 # ---------------------------------------------------------------------------
 # Shared test constants
@@ -189,3 +197,148 @@ class TestLibriSpeechDataset:
         assert sample.dtype == np.float32, (
             f"Expected float32, got {sample.dtype}"
         )
+
+
+# ---------------------------------------------------------------------------
+# DEMANDNoiseType tests
+# ---------------------------------------------------------------------------
+
+
+class TestDEMANDNoiseType:
+    def test_all_expected_members_present(self) -> None:
+        expected = {
+            "KITCHEN",
+            "LIVING",
+            "WASHING",
+            "FIELD",
+            "PARK",
+            "RIVER",
+            "HALLWAY",
+            "MEETING",
+            "OFFICE",
+            "CAFETERIA",
+            "RESTAURANT",
+            "STATION",
+            "SQUARE",
+            "TRAFFIC",
+            "BUS",
+            "CAR",
+            "METRO",
+        }
+        assert {m.name for m in DEMANDNoiseType} == expected
+
+    def test_member_values_are_strings(self) -> None:
+        for member in DEMANDNoiseType:
+            assert isinstance(member.value, str)
+
+    def test_known_value(self) -> None:
+        assert DEMANDNoiseType.KITCHEN.value == "DKITCHEN_16k"
+        assert DEMANDNoiseType.CAR.value == "TCAR_16k"
+
+
+# ---------------------------------------------------------------------------
+# DEMANDNoiseDataset fixture + tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mini_demand_entry_point(tmp_path: Path) -> Path:
+    """Create a minimal DEMAND root with one synthetic WAV recording.
+
+    Structure::
+
+        tmp_path/
+            DKITCHEN_16k/
+                ch01.wav
+    """
+    import soundfile as sf
+
+    env_dir = tmp_path / "DKITCHEN_16k"
+    env_dir.mkdir()
+    rng = np.random.default_rng(42)
+    audio = rng.uniform(-1.0, 1.0, size=16_000).astype(np.float32)
+    sf.write(env_dir / "ch01.wav", audio, samplerate=16_000)
+    return tmp_path
+
+
+class TestDEMANDNoiseDataset:
+    def test_init_valid(self, mini_demand_entry_point: Path) -> None:
+        ds = DEMANDNoiseDataset(
+            mini_demand_entry_point, [DEMANDNoiseType.KITCHEN]
+        )
+        assert ds.noise is not None
+
+    def test_noise_is_ndarray(self, mini_demand_entry_point: Path) -> None:
+        ds = DEMANDNoiseDataset(
+            mini_demand_entry_point, [DEMANDNoiseType.KITCHEN]
+        )
+        assert isinstance(ds.noise, np.ndarray)
+
+    def test_noise_non_empty(self, mini_demand_entry_point: Path) -> None:
+        ds = DEMANDNoiseDataset(
+            mini_demand_entry_point, [DEMANDNoiseType.KITCHEN]
+        )
+        assert ds.noise.shape[0] > 0
+
+    def test_repr_contains_class_name(
+        self, mini_demand_entry_point: Path
+    ) -> None:
+        ds = DEMANDNoiseDataset(
+            mini_demand_entry_point, [DEMANDNoiseType.KITCHEN]
+        )
+        assert "DEMANDNoiseDataset" in repr(ds)
+
+    def test_repr_contains_fs_and_samples(
+        self, mini_demand_entry_point: Path
+    ) -> None:
+        ds = DEMANDNoiseDataset(
+            mini_demand_entry_point, [DEMANDNoiseType.KITCHEN]
+        )
+        r = repr(ds)
+        assert "fs=" in r
+        assert "noise_samples=" in r
+
+    def test_repr_is_closed(self, mini_demand_entry_point: Path) -> None:
+        ds = DEMANDNoiseDataset(
+            mini_demand_entry_point, [DEMANDNoiseType.KITCHEN]
+        )
+        assert repr(ds).endswith(")")
+
+    def test_missing_env_raises_entry_point_error(
+        self, mini_demand_entry_point: Path
+    ) -> None:
+        with pytest.raises(EntryPointError):
+            DEMANDNoiseDataset(mini_demand_entry_point, [DEMANDNoiseType.CAR])
+
+
+# ---------------------------------------------------------------------------
+# add_noise_snr tests
+# ---------------------------------------------------------------------------
+
+
+class TestAddNoiseSNR:
+    _rng = np.random.default_rng(0)
+    _signal = _rng.uniform(-0.5, 0.5, size=16_000).astype(np.float32)
+    _noise = _rng.uniform(-1.0, 1.0, size=16_000).astype(np.float32)
+
+    def test_output_length_matches_signal(self) -> None:
+        out = add_noise_snr(self._signal, self._noise, snr_db=10.0)
+        assert len(out) == len(self._signal)
+
+    def test_output_dtype_float32(self) -> None:
+        out = add_noise_snr(self._signal, self._noise, snr_db=10.0)
+        assert out.dtype == np.float32
+
+    def test_output_within_unit_range(self) -> None:
+        out = add_noise_snr(self._signal, self._noise, snr_db=10.0)
+        assert np.max(np.abs(out)) <= 1.0 + 1e-6
+
+    def test_shorter_noise_is_padded(self) -> None:
+        short_noise = self._noise[: len(self._signal) // 2]
+        out = add_noise_snr(self._signal, short_noise, snr_db=10.0)
+        assert len(out) == len(self._signal)
+
+    def test_longer_noise_is_truncated(self) -> None:
+        long_noise = np.tile(self._noise, 3)
+        out = add_noise_snr(self._signal, long_noise, snr_db=10.0)
+        assert len(out) == len(self._signal)
