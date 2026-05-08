@@ -3,13 +3,16 @@
 FROM python:3.12-slim
 
 # ── System dependencies ───────────────────────────────────────────────────────
-# libsndfile1  — required by librosa / soundfile to read audio files
-# ffmpeg       — fallback audio decoder used by librosa
-# libgomp1     — OpenMP runtime required by PyTorch CPU kernels
+# libsndfile1    — required by librosa / soundfile to read audio files
+# ffmpeg         — fallback audio decoder used by librosa
+# libgomp1       — OpenMP runtime required by PyTorch CPU kernels
+# build-essential — gcc/g++ needed to compile pesq (C extension); removed after
+#                   pip install to keep the final image slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libsndfile1 \
         ffmpeg \
         libgomp1 \
+        build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -32,7 +35,9 @@ RUN pip install --no-cache-dir \
         "numpy>=2.4.3" \
         "pesq>=0.0.4" \
         "pystoi>=0.4.1" \
-        "tqdm>=4.67.3"
+        "tqdm>=4.67.3" \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 # ── Application source ────────────────────────────────────────────────────────
 COPY src/ src/
