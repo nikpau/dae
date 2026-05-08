@@ -53,3 +53,36 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to server
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: SSH and redeploy
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          script: |
+            IMAGE="ghcr.io/${{ github.repository }}:latest"
+            CONTAINER="speech-enhancement"
+
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+            docker pull "${IMAGE}"
+
+            docker stop "${CONTAINER}" 2>/dev/null || true
+            docker rm   "${CONTAINER}" 2>/dev/null || true
+
+            docker run -d \
+              --name "${CONTAINER}" \
+              --restart unless-stopped \
+              -p 7860:7860 \
+              "${IMAGE}"
+
+            docker image prune -f
+            echo "Deployed ${IMAGE} successfully."
