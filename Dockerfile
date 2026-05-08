@@ -36,6 +36,7 @@ RUN pip install --no-cache-dir \
         "pesq>=0.0.4" \
         "pystoi>=0.4.1" \
         "tqdm>=4.67.3" \
+        "matplotlib>=3.10.9" \
     && apt-get purge -y --auto-remove build-essential \
     && rm -rf /var/lib/apt/lists/*
 
