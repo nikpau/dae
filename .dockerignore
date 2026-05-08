@@ -1,0 +1,29 @@
+# Version control
+.git/
+.gitignore
+
+# Python artefacts
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Training data (large; not needed at inference time)
+data/train-clean-100/
+data/test-clean/
+
+# DEMAND noise data — mount at runtime via -v if the noise-mix tab is needed
+data/noise/
+
+# TensorBoard runs and experiment plots
+runs/
+plots/
+
+# Development files
+tests/
+scripts/
+literature/
+README.md
