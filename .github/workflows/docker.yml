@@ -76,8 +76,8 @@ jobs:
 
             docker pull "${IMAGE}"
 
-            docker stop "${CONTAINER}" 2>/dev/null || true
-            docker rm   "${CONTAINER}" 2>/dev/null || true
+            docker stop "${CONTAINER}" 2>/dev/null
+            docker rm   "${CONTAINER}" 2>/dev/null
 
             docker run -d \
               --name "${CONTAINER}" \
