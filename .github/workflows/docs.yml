@@ -36,15 +36,6 @@ jobs:
       - name: Build HTML docs
         run: sphinx-build -b html docs docs/_build/html
 
-      - name: Deploy docs
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          port: ${{ secrets.DEPLOY_PORT || 22 }}
-          script: mkdir -p /var/www/dae-docs
-
       - name: Rsync docs to server
         uses: burnett01/rsync-deployments@7.0.1
         with:
