@@ -89,287 +89,291 @@ class Hyperparameters(NamedTuple):
 
 hp = Hyperparameters()
 
-# Writer to track training with TensorBoard (logs to `<root>/runs`).
-writer = SummaryWriter()
 
-# Load all requested DEMAND noise environments into a single concatenated array.
-noise_ds = DEMANDNoiseDataset(
-    entry_point=hp.DEMAND_entry_point,
-    noise_types=hp.noise_types,
-    sample_rate=hp.sampling_rate,
-)
-
-# Both train and test use the same feature settings; only the noise source
-# differs (same noise pool is reused — random offsets make each draw unique).
-_extractor_kwargs = dict(
-    sampling_rate=hp.sampling_rate,
-    window_length=hp.window_length,
-    hop_length=hp.hop_length,
-)
-train_extractor = LogMagnitudeSpectrumExtractor(
-    **_extractor_kwargs, noise=noise_ds
-)
-test_extractor = LogMagnitudeSpectrumExtractor(
-    **_extractor_kwargs, noise=noise_ds
-)
-
-librispeech_train = data.LibriSpeechDataset(
-    entry_point=hp.train_data_path,
-    extractor=train_extractor,
-    sample_rate=hp.sampling_rate,
-)
-
-librispeech_test = data.LibriSpeechDataset(
-    entry_point=hp.test_data_path,
-    extractor=test_extractor,
-    sample_rate=hp.sampling_rate,
-)
-
-autoencoder = nets.VanillaAutoEncoder(
-    input_dim=librispeech_train.sample_shape[0],
-    latent_dim=hp.latent_dim,
-    hidden_layer_struct=hp.hidden_layer_struct,
-    dropout=hp.dropout,
-)
-optimizer = Adam(autoencoder.parameters(), lr=1e-3, weight_decay=1e-5)
-scheduler = ReduceLROnPlateau(
-    optimizer,
-    mode="min",
-    factor=hp.lr_factor,
-    patience=hp.lr_patience,
-    min_lr=hp.lr_min,
-)
-loss_fn = nn.MSELoss()
-
-train_data = DataLoader(librispeech_train, batch_size=hp.batch_size)
-test_data = DataLoader(librispeech_test, batch_size=hp.batch_size)
-
-n_iter = 0
-best_val_loss = torch.inf
-timestamp = time.time()
-
-
-def _snr_improvement_db(
-    inputs: torch.Tensor, outputs: torch.Tensor, labels: torch.Tensor
-) -> float:
-    """Return mean SNR improvement in dB over a batch.
-
-    SNR improvement = 10·log10(input_noise_power / residual_noise_power), where
-    *input_noise_power* is the power of ``(inputs - labels)`` and
-    *residual_noise_power* is the power of ``(outputs - labels)``.  A positive
-    value means the model reduced the noise.
-
-    :param inputs:  Noisy input batch, shape ``(B, F)``.
-    :param outputs: Model reconstructions, shape ``(B, F)``.
-    :param labels:  Clean reference batch, shape ``(B, F)``.
-    :returns: Mean SNR improvement in dB (scalar float).
-    """
-    input_noise_power = (inputs - labels).pow(2).mean()
-    residual_power = (outputs - labels).pow(2).mean()
-    # Guard against division by zero or log of zero.
-    if residual_power < 1e-12 or input_noise_power < 1e-12:
-        return 0.0
-    return 10.0 * math.log10((input_noise_power / residual_power).item())
-
-
-def _grad_norm(module: nn.Module) -> float:
-    """Compute the L2 norm of all gradients in *module*.
-
-    :param module: Any :class:`torch.nn.Module` whose parameters have
-        ``.grad`` populated (i.e. after ``loss.backward()``).
-    :returns: L2 gradient norm (scalar float), or ``0.0`` if no gradients
-        are available yet.
-    """
-    total = 0.0
-    for p in module.parameters():
-        if p.grad is not None:
-            total += p.grad.detach().pow(2).sum().item()
-    return math.sqrt(total)
-
-
-def run_quick_val(max_batches: int) -> tuple[float, float]:
-    """Run a partial validation pass over *max_batches* batches.
-
-    Temporarily switches the model to eval mode and disables gradient
-    computation to save memory, then restores training mode.
-
-    :param max_batches: Maximum number of test batches to evaluate.
-    :returns: Tuple of ``(avg_mse_loss, avg_snr_improvement_db)``.
-    """
-    autoencoder.eval()
-    total_loss = 0.0
-    total_snr = 0.0
-    n_batches = 0
-
-    with torch.no_grad():
-        for vinputs, vlabels in test_data:
-            if n_batches >= max_batches:
-                break
-            vinputs = vinputs.float()
-            vlabels = vlabels.float()
-            voutputs = autoencoder(vinputs)
-            total_loss += loss_fn(voutputs, vlabels).item()
-            total_snr += _snr_improvement_db(vinputs, voutputs, vlabels)
-            n_batches += 1
-
-    autoencoder.train()
-    avg_loss = total_loss / max(n_batches, 1)
-    avg_snr = total_snr / max(n_batches, 1)
-    return avg_loss, avg_snr
-
-
-def train_epoch(
-    n_iter: int, epoch_number: int, writer: SummaryWriter
-) -> tuple[float, int]:
-    """Train for one full epoch and return ``(avg_train_loss, n_iter)``.
-
-    Every ``LOG_EVERY`` batches the smoothed training loss is written to
-    TensorBoard.  Every ``VAL_EVERY`` batches a quick partial validation is
-    run, logging val loss, SNR improvement, val/train loss ratio, and
-    gradient norms.
-
-    :param n_iter: Global sample counter at the start of this epoch.
-    :param epoch_number: Zero-based epoch index (used for log labels).
-    :param writer: Active :class:`~torch.utils.tensorboard.SummaryWriter`.
-    :returns: Tuple of ``(recent_smoothed_train_loss, updated_n_iter)``.
-    """
-    running_loss = 0.0
-    recent_loss = 0.0
-
-    for i, (input, label) in enumerate(train_data):
-        optimizer.zero_grad()
-
-        prediction = autoencoder(input)
-        loss: torch.Tensor = loss_fn(prediction, label)
-        loss.backward()
-        optimizer.step()
-
-        running_loss += loss.item()
-        n_iter += hp.batch_size
-
-        # ── Periodic train logging ────────────────────────────────────────────
-        if (i + 1) % hp.log_every == 0:
-            recent_loss = running_loss / hp.log_every
-            writer.add_scalar("Loss/train", recent_loss, n_iter)
-            running_loss = 0.0
-
-        # ── Quick validation every VAL_EVERY batches ──────────────────────────
-        if (i + 1) % hp.val_every == 0:
-            val_loss, val_snr = run_quick_val(hp.val_batches)
-            enc_gnorm = _grad_norm(autoencoder.encoder)
-            dec_gnorm = _grad_norm(autoencoder.decoder)
-
-            writer.add_scalar("Loss/val_quick", val_loss, n_iter)
-            writer.add_scalar("SNR/val_quick", val_snr, n_iter)
-            writer.add_scalar("GradNorm/encoder", enc_gnorm, n_iter)
-            writer.add_scalar("GradNorm/decoder", dec_gnorm, n_iter)
-            if recent_loss > 0:
-                writer.add_scalar(
-                    "Ratio/val_to_train", val_loss / recent_loss, n_iter
-                )
-
-    return recent_loss, n_iter
-
-
-# Claude vibed me some startup banner code, so here it is:
-# ── Startup banner ────────────────────────────────────────────────────────────
-def _print_startup_banner() -> None:
-    """Print a formatted training-configuration summary to stdout."""
-    W = 64
-    COL = 18  # label column width
-
-    def hr(ch: str = "─") -> str:
-        return "  " + ch * W
-
-    def row(label: str, value: str) -> str:
-        return f"  {label:<{COL}}{value}"
-
-    # ── noise-type summary ────────────────────────────────────────────────────
-    nt = hp.noise_types
-    if nt is DEMANDNoiseType.ALL:
-        env_names = [n.replace("_16k", "") for n in DEMANDNoiseType.ALL.value]
-        noise_header = f"ALL  ({len(env_names)} environments)"
-    else:
-        env_names = [t.name for t in nt]
-        noise_header = f"{len(env_names)} environment(s)"
-    env_lines = textwrap.wrap("  ".join(env_names), width=W - COL - 2)
-
-    total_params = sum(p.numel() for p in autoencoder.parameters())
-    lr = optimizer.defaults["lr"]
-    wd = optimizer.defaults["weight_decay"]
-    started_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
-
-    print()
-    print(f"  ╔{'═' * W}╗")
-    print(f"  ║{'  Denoising AutoEncoder – Training'.center(W)}║")
-    print(f"  ║{started_at.center(W)}║")
-    print(f"  ╚{'═' * W}╝")
-
-    print()
-    print("  DATA")
-    print(hr())
-    print(row("Train path", str(hp.train_data_path)))
-    print(
-        row(
-            "Train files", f"{len(librispeech_train._source_flac_paths):,} FLAC"
-        )
-    )
-    print(row("Test path", str(hp.test_data_path)))
-    print(
-        row("Test files", f"{len(librispeech_test._source_flac_paths):,} FLAC")
-    )
-
-    print()
-    print("  FEATURES")
-    print(hr())
-    print(row("window_length", f"{hp.window_length} samples"))
-    print(row("hop_length", f"{hp.hop_length} samples"))
-    print(row("sample shape", str(librispeech_train.sample_shape)))
-
-    print()
-    print("  NOISE AUGMENTATION")
-    print(hr())
-    for i, line in enumerate(env_lines):
-        print(row(noise_header if i == 0 else "", line))
-
-    print()
-    print("  MODEL")
-    print(hr())
-    print(row("Architecture", type(autoencoder).__name__))
-    print(row("Input dim", f"{librispeech_train.sample_shape[0]:,}"))
-    print(row("Latent dim", "128"))
-    print(row("Total params", f"{total_params:,}"))
-
-    print()
-    print("  TRAINING")
-    print(hr())
-    print(row("Epochs", str(hp.n_epochs)))
-    print(row("Batch size", str(hp.batch_size)))
-    print(row("Optimizer", f"Adam  lr={lr:.0e}  weight_decay={wd:.0e}"))
-    print(
-        row(
-            "LR scheduler",
-            f"ReduceLROnPlateau  patience={hp.lr_patience}  "
-            f"factor={hp.lr_factor}  min_lr={hp.lr_min:.0e}",
-        )
-    )
-    print(row("Loss", type(loss_fn).__name__))
-    print(
-        row(
-            "Val every",
-            f"{hp.val_every} batches  ({hp.val_batches} per quick pass)",
-        )
-    )
-    print(row("TensorBoard", writer.log_dir))
-
-    print()
-    print("  " + "═" * W)
-    print("  Starting training …")
-    print("  " + "═" * W)
-    print()
-
-
+# Guard against import-time side effects
 if __name__ == "__main__":
+    # Writer to track training with TensorBoard (logs to `<root>/runs`).
+    writer = SummaryWriter()
+
+    # Load all requested DEMAND noise environments into a single concatenated array.
+    noise_ds = DEMANDNoiseDataset(
+        entry_point=hp.DEMAND_entry_point,
+        noise_types=hp.noise_types,
+        sample_rate=hp.sampling_rate,
+    )
+
+    # Both train and test use the same feature settings; only the noise source
+    # differs (same noise pool is reused — random offsets make each draw unique).
+    _extractor_kwargs = dict(
+        sampling_rate=hp.sampling_rate,
+        window_length=hp.window_length,
+        hop_length=hp.hop_length,
+    )
+    train_extractor = LogMagnitudeSpectrumExtractor(
+        **_extractor_kwargs, noise=noise_ds
+    )
+    test_extractor = LogMagnitudeSpectrumExtractor(
+        **_extractor_kwargs, noise=noise_ds
+    )
+
+    librispeech_train = data.LibriSpeechDataset(
+        entry_point=hp.train_data_path,
+        extractor=train_extractor,
+        sample_rate=hp.sampling_rate,
+    )
+
+    librispeech_test = data.LibriSpeechDataset(
+        entry_point=hp.test_data_path,
+        extractor=test_extractor,
+        sample_rate=hp.sampling_rate,
+    )
+
+    autoencoder = nets.VanillaAutoEncoder(
+        input_dim=librispeech_train.sample_shape[0],
+        latent_dim=hp.latent_dim,
+        hidden_layer_struct=hp.hidden_layer_struct,
+        dropout=hp.dropout,
+    )
+    optimizer = Adam(autoencoder.parameters(), lr=1e-3, weight_decay=1e-5)
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=hp.lr_factor,
+        patience=hp.lr_patience,
+        min_lr=hp.lr_min,
+    )
+    loss_fn = nn.MSELoss()
+
+    train_data = DataLoader(librispeech_train, batch_size=hp.batch_size)
+    test_data = DataLoader(librispeech_test, batch_size=hp.batch_size)
+
+    n_iter = 0
+    best_val_loss = torch.inf
+    timestamp = time.time()
+
+    def _snr_improvement_db(
+        inputs: torch.Tensor, outputs: torch.Tensor, labels: torch.Tensor
+    ) -> float:
+        """Return mean SNR improvement in dB over a batch.
+
+        SNR improvement = 10·log10(input_noise_power / residual_noise_power), where
+        *input_noise_power* is the power of ``(inputs - labels)`` and
+        *residual_noise_power* is the power of ``(outputs - labels)``.  A positive
+        value means the model reduced the noise.
+
+        :param inputs:  Noisy input batch, shape ``(B, F)``.
+        :param outputs: Model reconstructions, shape ``(B, F)``.
+        :param labels:  Clean reference batch, shape ``(B, F)``.
+        :returns: Mean SNR improvement in dB (scalar float).
+        """
+        input_noise_power = (inputs - labels).pow(2).mean()
+        residual_power = (outputs - labels).pow(2).mean()
+        # Guard against division by zero or log of zero.
+        if residual_power < 1e-12 or input_noise_power < 1e-12:
+            return 0.0
+        return 10.0 * math.log10((input_noise_power / residual_power).item())
+
+    def _grad_norm(module: nn.Module) -> float:
+        """Compute the L2 norm of all gradients in *module*.
+
+        :param module: Any :class:`torch.nn.Module` whose parameters have
+            ``.grad`` populated (i.e. after ``loss.backward()``).
+        :returns: L2 gradient norm (scalar float), or ``0.0`` if no gradients
+            are available yet.
+        """
+        total = 0.0
+        for p in module.parameters():
+            if p.grad is not None:
+                total += p.grad.detach().pow(2).sum().item()
+        return math.sqrt(total)
+
+    def run_quick_val(max_batches: int) -> tuple[float, float]:
+        """Run a partial validation pass over *max_batches* batches.
+
+        Temporarily switches the model to eval mode and disables gradient
+        computation to save memory, then restores training mode.
+
+        :param max_batches: Maximum number of test batches to evaluate.
+        :returns: Tuple of ``(avg_mse_loss, avg_snr_improvement_db)``.
+        """
+        autoencoder.eval()
+        total_loss = 0.0
+        total_snr = 0.0
+        n_batches = 0
+
+        with torch.no_grad():
+            for vinputs, vlabels in test_data:
+                if n_batches >= max_batches:
+                    break
+                vinputs = vinputs.float()
+                vlabels = vlabels.float()
+                voutputs = autoencoder(vinputs)
+                total_loss += loss_fn(voutputs, vlabels).item()
+                total_snr += _snr_improvement_db(vinputs, voutputs, vlabels)
+                n_batches += 1
+
+        autoencoder.train()
+        avg_loss = total_loss / max(n_batches, 1)
+        avg_snr = total_snr / max(n_batches, 1)
+        return avg_loss, avg_snr
+
+    def train_epoch(
+        n_iter: int, epoch_number: int, writer: SummaryWriter
+    ) -> tuple[float, int]:
+        """Train for one full epoch and return ``(avg_train_loss, n_iter)``.
+
+        Every ``LOG_EVERY`` batches the smoothed training loss is written to
+        TensorBoard.  Every ``VAL_EVERY`` batches a quick partial validation is
+        run, logging val loss, SNR improvement, val/train loss ratio, and
+        gradient norms.
+
+        :param n_iter: Global sample counter at the start of this epoch.
+        :param epoch_number: Zero-based epoch index (used for log labels).
+        :param writer: Active :class:`~torch.utils.tensorboard.SummaryWriter`.
+        :returns: Tuple of ``(recent_smoothed_train_loss, updated_n_iter)``.
+        """
+        running_loss = 0.0
+        recent_loss = 0.0
+
+        for i, (input, label) in enumerate(train_data):
+            optimizer.zero_grad()
+
+            prediction = autoencoder(input)
+            loss: torch.Tensor = loss_fn(prediction, label)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            n_iter += hp.batch_size
+
+            # ── Periodic train logging ────────────────────────────────────────────
+            if (i + 1) % hp.log_every == 0:
+                recent_loss = running_loss / hp.log_every
+                writer.add_scalar("Loss/train", recent_loss, n_iter)
+                running_loss = 0.0
+
+            # ── Quick validation every VAL_EVERY batches ──────────────────────────
+            if (i + 1) % hp.val_every == 0:
+                val_loss, val_snr = run_quick_val(hp.val_batches)
+                enc_gnorm = _grad_norm(autoencoder.encoder)
+                dec_gnorm = _grad_norm(autoencoder.decoder)
+
+                writer.add_scalar("Loss/val_quick", val_loss, n_iter)
+                writer.add_scalar("SNR/val_quick", val_snr, n_iter)
+                writer.add_scalar("GradNorm/encoder", enc_gnorm, n_iter)
+                writer.add_scalar("GradNorm/decoder", dec_gnorm, n_iter)
+                if recent_loss > 0:
+                    writer.add_scalar(
+                        "Ratio/val_to_train", val_loss / recent_loss, n_iter
+                    )
+
+        return recent_loss, n_iter
+
+    # Claude vibed me some startup banner code, so here it is:
+    # ── Startup banner ────────────────────────────────────────────────────────────
+    def _print_startup_banner() -> None:
+        """Print a formatted training-configuration summary to stdout."""
+        W = 64
+        COL = 18  # label column width
+
+        def hr(ch: str = "─") -> str:
+            return "  " + ch * W
+
+        def row(label: str, value: str) -> str:
+            return f"  {label:<{COL}}{value}"
+
+        # ── noise-type summary ────────────────────────────────────────────────────
+        nt = hp.noise_types
+        if nt is DEMANDNoiseType.ALL:
+            env_names = [
+                n.replace("_16k", "") for n in DEMANDNoiseType.ALL.value
+            ]
+            noise_header = f"ALL  ({len(env_names)} environments)"
+        else:
+            env_names = [t.name for t in nt]
+            noise_header = f"{len(env_names)} environment(s)"
+        env_lines = textwrap.wrap("  ".join(env_names), width=W - COL - 2)
+
+        total_params = sum(p.numel() for p in autoencoder.parameters())
+        lr = optimizer.defaults["lr"]
+        wd = optimizer.defaults["weight_decay"]
+        started_at = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(timestamp)
+        )
+
+        print()
+        print(f"  ╔{'═' * W}╗")
+        print(f"  ║{'  Denoising AutoEncoder – Training'.center(W)}║")
+        print(f"  ║{started_at.center(W)}║")
+        print(f"  ╚{'═' * W}╝")
+
+        print()
+        print("  DATA")
+        print(hr())
+        print(row("Train path", str(hp.train_data_path)))
+        print(
+            row(
+                "Train files",
+                f"{len(librispeech_train._source_flac_paths):,} FLAC",
+            )
+        )
+        print(row("Test path", str(hp.test_data_path)))
+        print(
+            row(
+                "Test files",
+                f"{len(librispeech_test._source_flac_paths):,} FLAC",
+            )
+        )
+
+        print()
+        print("  FEATURES")
+        print(hr())
+        print(row("window_length", f"{hp.window_length} samples"))
+        print(row("hop_length", f"{hp.hop_length} samples"))
+        print(row("sample shape", str(librispeech_train.sample_shape)))
+
+        print()
+        print("  NOISE AUGMENTATION")
+        print(hr())
+        for i, line in enumerate(env_lines):
+            print(row(noise_header if i == 0 else "", line))
+
+        print()
+        print("  MODEL")
+        print(hr())
+        print(row("Architecture", type(autoencoder).__name__))
+        print(row("Input dim", f"{librispeech_train.sample_shape[0]:,}"))
+        print(row("Latent dim", "128"))
+        print(row("Total params", f"{total_params:,}"))
+
+        print()
+        print("  TRAINING")
+        print(hr())
+        print(row("Epochs", str(hp.n_epochs)))
+        print(row("Batch size", str(hp.batch_size)))
+        print(row("Optimizer", f"Adam  lr={lr:.0e}  weight_decay={wd:.0e}"))
+        print(
+            row(
+                "LR scheduler",
+                f"ReduceLROnPlateau  patience={hp.lr_patience}  "
+                f"factor={hp.lr_factor}  min_lr={hp.lr_min:.0e}",
+            )
+        )
+        print(row("Loss", type(loss_fn).__name__))
+        print(
+            row(
+                "Val every",
+                f"{hp.val_every} batches  ({hp.val_batches} per quick pass)",
+            )
+        )
+        print(row("TensorBoard", writer.log_dir))
+
+        print()
+        print("  " + "═" * W)
+        print("  Starting training …")
+        print("  " + "═" * W)
+        print()
+
     # Training loop with periodic validation and TensorBoard logging.
     _print_startup_banner()
 
