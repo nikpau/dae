@@ -26,3 +26,7 @@ wheels/
 
 # Tensorboard run logs
 /runs/
+
+# Sphinx build output
+docs/_build/
+/runs/
