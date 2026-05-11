@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir \
 
 # ── Application source ────────────────────────────────────────────────────────
 COPY src/ src/
-COPY models/ models/
+COPY models/simple_autoencoder_logmag_spec_noisy_clean models/
 
 # Install the package and all dependencies declared in pyproject.toml.
 RUN pip install --no-cache-dir . \
