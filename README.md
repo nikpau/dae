@@ -1,8 +1,8 @@
-# Autoencoders for Speech Enhancement
+# libdse — Library for Deep Speech Enhancement
 
 This is the accompanying code for my [blog post on Denoising AutoEncoders](https://iam.nikpau.io/blog/speech_enhancement_3/).
 
-A PyTorch implementation of a **Denoising Autoencoder (DAE)** for single-channel speech enhancement, following the approach of Lu et al. (2013) - *Speech Enhancement Based on Deep Denoising Autoencoder* — with architecture choices informed by Nossier et al. (2020) - *An Experimental Analysis of Deep Learning Architectures for Supervised Speech Enhancement*.
+A PyTorch implementation of speech enhancement models, starting with a **Denoising Autoencoder (DAE)** following Lu et al. (2013) - *Speech Enhancement Based on Deep Denoising Autoencoder* — with architecture choices informed by Nossier et al. (2020) - *An Experimental Analysis of Deep Learning Architectures for Supervised Speech Enhancement* — and extending to a time-domain **Wave-U-Net** (Stoller et al., 2018).
 
 The API documentation can be found [here](https://dae.nikpau.io/docs/).
 
@@ -92,19 +92,20 @@ At inference time each frame is denoised independently. To recover a waveform th
 speech_enhancement/
 ├── src/
 │   └── libdse/
-│       ├── nets.py                          # VanillaAutoEncoder definition
-│       ├── metrics.py                       # Evaluation metrics (PESQ, STOI)
+│       ├── nets.py                          # VanillaAutoEncoder, WaveUNet
+│       ├── evaluation.py                    # Evaluation metrics (PESQ, STOI)
 │       ├── data/
-│       │   ├── features.py                  # LogMagnitudeSpectrumExtractor
+│       │   ├── features.py                  # Feature extractors (log-mag, mel, raw)
 │       │   ├── librispeech.py               # LibriSpeechDataset (IterableDataset)
 │       │   ├── noise.py                     # DEMANDNoiseDataset, add_noise_snr
 │       │   └── err.py                       # Custom exceptions
 │       ├── train/
-│       │   └── simpleAE_logmag_nc.py        # Training script + Hyperparameters
+│       │   └── dae.py                       # DAE training script + hyperparameters
 │       └── showcases/
-│           └── simpleAE_logmag_nc.py        # Gradio demo app
+│           └── dae.py                       # Gradio demo app
+├── Dockerfile                               # Containerised Gradio demo
 ├── models/
-│   └── simple_autoencoder_logmag_spec_noisy_clean   # Trained checkpoint
+│   └── simple_autoencoder_logmag_spec_noisy_clean   # Trained DAE checkpoint
 ├── data/
 │   ├── train-clean-100/                     # LibriSpeech training corpus
 │   ├── test-clean/                          # LibriSpeech test corpus
@@ -150,7 +151,7 @@ data/
 ## Training
 
 ```bash
-python -m libdse.train.simpleAE_logmag_nc
+python -m libdse.train.dae
 ```
 
 The checkpoint with the best validation loss is saved to `models/simple_autoencoder_logmag_spec_noisy_clean`.
@@ -162,8 +163,17 @@ The checkpoint with the best validation loss is saved to `models/simple_autoenco
 A pre-trained checkpoint is included in `models/`. Launch the interactive demo with:
 
 ```bash
-python -m libdse.showcases.simpleAE_logmag_nc
+python -m libdse.showcases.dae
 ```
+
+Alternatively, run the containerised version with Docker:
+
+```bash
+docker build -t libdse-demo .
+docker run -p 7860:7860 libdse-demo
+```
+
+Then open [http://localhost:7860](http://localhost:7860) in your browser.
 
 The app exposes two tabs:
 
@@ -187,4 +197,7 @@ uv run pytest
 - [x] Training loop with MSE loss, LR scheduling, TensorBoard logging
 - [x] Waveform reconstruction via phase borrowing + `istft`
 - [x] Gradio demo app
-- [ ] Containerise the Gradio app for server deployment
+- [x] Containerise the Gradio app for server deployment
+- [x] Wave-U-Net architecture (`libdse.nets.WaveUNet`)
+- [ ] Wave-U-Net training script
+- [ ] Wave-U-Net validation & evaluation
